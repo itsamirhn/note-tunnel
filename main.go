@@ -38,7 +38,6 @@ var (
 var baseURL string // set via -ldflags "-X main.baseURL=..."
 
 var (
-	capisRe    = regexp.MustCompile(`name=capis\s+value=(\d+)`)
 	textareaRe = regexp.MustCompile(`<textarea[^>]*>([\s\S]*?)</textarea>`)
 	httpClient = &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
 )
@@ -49,11 +48,7 @@ type client struct{ email, password string }
 
 func (c *client) register() error {
 	slog.Debug("registering account", "email", c.email)
-	cap, err := getCaptcha("sign.php")
-	if err != nil {
-		return err
-	}
-	resp, err := post("sign2.php", url.Values{"email": {c.email}, "password": {c.password}, "password2": {c.password}, "capis": {cap}, "cap": {cap}, "submit": {"submit"}})
+	resp, err := post("sign2.php", url.Values{"email": {c.email}, "password": {c.password}, "password2": {c.password}, "submit": {"submit"}})
 	if err != nil {
 		return err
 	}
@@ -66,11 +61,7 @@ func (c *client) register() error {
 
 func (c *client) read() (string, error) {
 	slog.Debug("reading note", "email", c.email)
-	cap, err := getCaptcha("web.php")
-	if err != nil {
-		return "", err
-	}
-	resp, err := post("panel.php", url.Values{"email": {c.email}, "password": {c.password}, "capis": {cap}, "cap": {cap}, "submit": {"submit"}})
+	resp, err := post("panel.php", url.Values{"email": {c.email}, "password": {c.password}, "submit": {"submit"}})
 	if err != nil {
 		return "", err
 	}
@@ -96,25 +87,6 @@ func (c *client) write(content string) error {
 		return nil
 	}
 	return fmt.Errorf("save failed")
-}
-
-func getCaptcha(page string) (string, error) {
-	slog.Debug("fetching captcha", "page", page)
-	resp, err := httpClient.Get(baseURL + "/" + page)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	m := capisRe.FindSubmatch(body)
-	if m == nil {
-		return "", fmt.Errorf("no captcha")
-	}
-	slog.Debug("captcha solved", "page", page, "value", string(m[1]))
-	return string(m[1]), nil
 }
 
 func post(path string, data url.Values) (string, error) {
