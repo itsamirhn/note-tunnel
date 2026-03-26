@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -18,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/xtaci/smux"
 )
 
 var (
@@ -25,7 +28,7 @@ var (
 	flagEmail = flag.String("email", "", "rendezvous account email")
 	flagPass  = flag.String("pass", "", "rendezvous account password")
 	flagAddr  = flag.String("addr", "", "server: upstream host:port, client: listen host:port")
-	flagPoll  = flag.Duration("poll", 200*time.Millisecond, "polling interval")
+	flagPoll  = flag.Duration("poll", 100*time.Millisecond, "polling interval")
 	flagChunk = flag.Int("chunk", 70000, "max chunk size in bytes")
 	flagBuf   = flag.Int("buf", 16, "tunnel channel buffer size")
 )
@@ -338,38 +341,83 @@ func parseChunk(raw string) (int, int, string) {
 	return i, n, raw[nl+1:]
 }
 
-// --- tcp bridge ---
+// --- tunnel conn adapter ---
 
-func bridge(conn net.Conn, t *tunnel) {
-	// conn → tunnel
-	go func() {
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := conn.Read(buf)
-			if n > 0 {
-				t.Outbox <- base64.StdEncoding.EncodeToString(buf[:n])
-			}
-			if err != nil {
-				return
-			}
+type tunnelConn struct {
+	tun    *tunnel
+	rbuf   bytes.Buffer
+	closed chan struct{}
+}
+
+func newTunnelConn(t *tunnel) *tunnelConn {
+	return &tunnelConn{tun: t, closed: make(chan struct{})}
+}
+
+func (tc *tunnelConn) Read(p []byte) (int, error) {
+	if tc.rbuf.Len() > 0 {
+		return tc.rbuf.Read(p)
+	}
+	select {
+	case msg, ok := <-tc.tun.Inbox:
+		if !ok {
+			return 0, io.EOF
 		}
-	}()
-
-	// tunnel → conn
-	for msg := range t.Inbox {
 		data, err := base64.StdEncoding.DecodeString(msg)
 		if err != nil {
-			continue
+			return 0, err
 		}
-		conn.Write(data)
+		tc.rbuf.Write(data)
+		return tc.rbuf.Read(p)
+	case <-tc.closed:
+		return 0, io.EOF
 	}
+}
+
+func (tc *tunnelConn) Write(p []byte) (int, error) {
+	select {
+	case <-tc.closed:
+		return 0, io.ErrClosedPipe
+	default:
+	}
+	tc.tun.Outbox <- base64.StdEncoding.EncodeToString(p)
+	return len(p), nil
+}
+
+func (tc *tunnelConn) Close() error {
+	select {
+	case <-tc.closed:
+	default:
+		close(tc.closed)
+	}
+	return nil
+}
+
+// --- relay ---
+
+func relay(a, b io.ReadWriteCloser) {
+	done := make(chan struct{}, 1)
+	cp := func(dst, src io.ReadWriteCloser) {
+		io.Copy(dst, src)
+		dst.Close()
+		done <- struct{}{}
+	}
+	go cp(a, b)
+	go cp(b, a)
+	<-done
 }
 
 // --- main ---
 
+func smuxConfig() *smux.Config {
+	cfg := smux.DefaultConfig()
+	cfg.KeepAliveInterval = 10 * time.Second
+	cfg.KeepAliveTimeout = 30 * time.Second
+	return cfg
+}
+
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: cnote-tunnel -role <server|client> -email <email> -pass <pass> -addr <host:port>\n\n")
+		fmt.Fprintf(os.Stderr, "usage: note-tunnel -role <server|client> -email <email> -pass <pass> -addr <host:port>\n\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -394,28 +442,61 @@ func main() {
 		os.Exit(1)
 	}
 
+	tc := newTunnelConn(t)
+	cfg := smuxConfig()
+
 	if role == "server" {
-		conn, err := net.Dial("tcp", addr)
+		session, err := smux.Server(tc, cfg)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		fmt.Fprintf(os.Stderr, "connected to %s\n", addr)
-		bridge(conn, t)
+		fmt.Fprintf(os.Stderr, "tunnel ready, forwarding to %s\n", addr)
+		for {
+			stream, err := session.AcceptStream()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return
+			}
+			go func() {
+				conn, err := net.Dial("tcp", addr)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "dial %s: %v\n", addr, err)
+					stream.Close()
+					return
+				}
+				fmt.Fprintf(os.Stderr, "stream %d → %s\n", stream.ID(), addr)
+				relay(stream, conn)
+			}()
+		}
 	} else {
+		session, err := smux.Client(tc, cfg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 		fmt.Fprintf(os.Stderr, "listening on %s\n", addr)
-		conn, err := ln.Accept()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				continue
+			}
+			go func() {
+				stream, err := session.OpenStream()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "open stream: %v\n", err)
+					conn.Close()
+					return
+				}
+				fmt.Fprintf(os.Stderr, "%s → stream %d\n", conn.RemoteAddr(), stream.ID())
+				relay(stream, conn)
+			}()
 		}
-		fmt.Fprintf(os.Stderr, "accepted %s\n", conn.RemoteAddr())
-		ln.Close()
-		bridge(conn, t)
 	}
 }
