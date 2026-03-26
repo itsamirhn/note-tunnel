@@ -1,14 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -22,6 +21,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/xtaci/smux"
 )
 
 var (
@@ -32,6 +33,7 @@ var (
 	flagPoll  = flag.Duration("poll", 100*time.Millisecond, "polling interval")
 	flagChunk = flag.Int("chunk", 70000, "max chunk size in bytes")
 	flagBuf   = flag.Int("buf", 16, "tunnel channel buffer size")
+	flagSlots = flag.Int("slots", 4, "number of parallel note slots")
 	flagDebug = flag.Bool("debug", false, "enable debug logging")
 )
 
@@ -98,51 +100,21 @@ func post(path string, data url.Values) (string, error) {
 
 func b64(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
 
-// --- tunnel ---
-
-type tunnel struct {
-	send, recv     *client
-	Inbox, Outbox  chan string
-	poll           time.Duration
-	chunk          int
-}
-
-type rendezvousInfo struct {
-	AE string `json:"ae"`
-	AP string `json:"ap"`
-	BE string `json:"be"`
-	BP string `json:"bp"`
-}
-
-func randHex(n int) string {
-	b := make([]byte, n)
-	rand.Read(b)
-	return hex.EncodeToString(b)
-}
-
-func randAccount() (string, string) {
-	return fmt.Sprintf("tun-%s@t.io", randHex(8)), randHex(16)
-}
-
 // --- account pool ---
 
 type accountPool struct {
-	seed       []byte
-	free       []int
-	next       int
-	registered map[int]bool
-	mu         sync.Mutex
+	seed []byte
 }
 
 func newAccountPool(email, pass string) *accountPool {
 	h := sha256.Sum256([]byte(email + ":" + pass))
-	return &accountPool{seed: h[:], registered: make(map[int]bool)}
+	return &accountPool{seed: h[:]}
 }
 
-func (p *accountPool) derive(idx int) (emailA, passA, emailB, passB string) {
+func (p *accountPool) derive(slot int) (emailA, passA, emailB, passB string) {
 	d := func(label string) string {
 		mac := hmac.New(sha256.New, p.seed)
-		mac.Write([]byte(fmt.Sprintf("%s-%d", label, idx)))
+		mac.Write([]byte(fmt.Sprintf("%s-%d", label, slot)))
 		return hex.EncodeToString(mac.Sum(nil))
 	}
 	emailA = fmt.Sprintf("tun-%s@t.io", d("ae")[:16])
@@ -152,204 +124,7 @@ func (p *accountPool) derive(idx int) (emailA, passA, emailB, passB string) {
 	return
 }
 
-func (p *accountPool) acquire() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if len(p.free) > 0 {
-		idx := p.free[len(p.free)-1]
-		p.free = p.free[:len(p.free)-1]
-		return idx
-	}
-	idx := p.next
-	p.next++
-	return idx
-}
-
-func (p *accountPool) release(idx int) {
-	p.mu.Lock()
-	p.free = append(p.free, idx)
-	p.mu.Unlock()
-}
-
-func (p *accountPool) isRegistered(idx int) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.registered[idx]
-}
-
-func (p *accountPool) markRegistered(idx int) {
-	p.mu.Lock()
-	p.registered[idx] = true
-	p.mu.Unlock()
-}
-
-func startServer(ctx context.Context, rv *client) (*tunnel, error) {
-	slog.Info("registering rendezvous account")
-	rv.register()
-	ae, ap := randAccount()
-	be, bp := randAccount()
-	a := &client{ae, ap}
-	b := &client{be, bp}
-	if err := a.register(); err != nil {
-		return nil, err
-	}
-	if err := b.register(); err != nil {
-		return nil, err
-	}
-	a.write("")
-	b.write("")
-	data, _ := json.Marshal(rendezvousInfo{ae, ap, be, bp})
-	if err := rv.write(string(data)); err != nil {
-		return nil, err
-	}
-	slog.Info("rendezvous published, waiting for client")
-	t := newTunnel(b, a)
-	t.run(ctx)
-	return t, nil
-}
-
-func startClient(ctx context.Context, rv *client) (*tunnel, error) {
-	slog.Info("waiting for rendezvous info")
-	var info rendezvousInfo
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-		content, err := rv.read()
-		if err != nil {
-			time.Sleep(time.Second)
-			continue
-		}
-		content = strings.TrimSpace(content)
-		if content == "" {
-			time.Sleep(*flagPoll)
-			continue
-		}
-		info = rendezvousInfo{}
-		if err := json.Unmarshal([]byte(content), &info); err != nil || info.AE == "" {
-			time.Sleep(time.Second)
-			continue
-		}
-		break
-	}
-	slog.Info("rendezvous received")
-	t := newTunnel(&client{info.AE, info.AP}, &client{info.BE, info.BP})
-	t.run(ctx)
-	return t, nil
-}
-
-func newTunnel(send, recv *client) *tunnel {
-	return &tunnel{
-		send: send, recv: recv,
-		Inbox:  make(chan string, *flagBuf),
-		Outbox: make(chan string, *flagBuf),
-		poll:   *flagPoll,
-		chunk:  *flagChunk,
-	}
-}
-
-func (t *tunnel) run(ctx context.Context) {
-	go t.sendLoop(ctx)
-	go t.recvLoop(ctx)
-}
-
-func (t *tunnel) sendRaw(ctx context.Context, data string) bool {
-	for t.send.write(data) != nil {
-		time.Sleep(t.poll)
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			return false
-		default:
-		}
-		c, err := t.send.read()
-		if err == nil && strings.TrimSpace(c) == "" {
-			return true
-		}
-		time.Sleep(t.poll)
-	}
-}
-
-func (t *tunnel) recvRaw(ctx context.Context) (string, bool) {
-	for {
-		select {
-		case <-ctx.Done():
-			return "", false
-		default:
-		}
-		content, err := t.recv.read()
-		if err != nil {
-			time.Sleep(t.poll)
-			continue
-		}
-		content = strings.TrimSpace(content)
-		if content == "" {
-			time.Sleep(t.poll)
-			continue
-		}
-		for t.recv.write("") != nil {
-			time.Sleep(t.poll)
-		}
-		return content, true
-	}
-}
-
-func (t *tunnel) sendLoop(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case msg := <-t.Outbox:
-			chunks := split(msg, t.chunk)
-			for i, chunk := range chunks {
-				if !t.sendRaw(ctx, fmt.Sprintf("%d/%d\n%s", i+1, len(chunks), chunk)) {
-					return
-				}
-			}
-		}
-	}
-}
-
-func (t *tunnel) recvLoop(ctx context.Context) {
-	var parts []string
-	var total int
-	for {
-		raw, ok := t.recvRaw(ctx)
-		if !ok {
-			return
-		}
-		i, n, body := parseChunk(raw)
-		if i <= 0 {
-			select {
-			case t.Inbox <- raw:
-			case <-ctx.Done():
-				return
-			}
-			continue
-		}
-		if i == 1 {
-			parts = make([]string, 0, n)
-			total = n
-		}
-		if n != total || i != len(parts)+1 {
-			slog.Warn("recvLoop chunk out of order, resetting", "i", i, "expected", len(parts)+1)
-			parts, total = nil, 0
-			continue
-		}
-		parts = append(parts, body)
-		if len(parts) == total {
-			select {
-			case t.Inbox <- strings.Join(parts, ""):
-			case <-ctx.Done():
-				return
-			}
-			parts, total = nil, 0
-		}
-	}
-}
+// --- rendezvous ---
 
 func split(s string, size int) []string {
 	if len(s) == 0 {
@@ -381,253 +156,341 @@ func parseChunk(raw string) (int, int, string) {
 	return i, n, raw[nl+1:]
 }
 
-// --- control protocol ---
+// --- slot tunnel (N parallel note pairs) ---
 
-type controlMsg struct {
-	Type string `json:"type"`
-	SID  string `json:"sid"`
-	Idx  int    `json:"idx"`
+type slotTunnel struct {
+	slots     int
+	sendSlots []*client // N send note accounts
+	recvSlots []*client // N recv note accounts
+	Inbox     chan []byte
+	Outbox    chan []byte
+	poll      time.Duration
+	chunk     int
 }
 
-// --- mux ---
+func newSlotTunnel(slots int, sendSlots, recvSlots []*client) *slotTunnel {
+	return &slotTunnel{
+		slots:     slots,
+		sendSlots: sendSlots,
+		recvSlots: recvSlots,
+		Inbox:     make(chan []byte, *flagBuf*slots),
+		Outbox:    make(chan []byte, *flagBuf*slots),
+		poll:      *flagPoll,
+		chunk:     *flagChunk,
+	}
+}
 
-type streamInfo struct {
-	tun    *tunnel
-	idx    int
+func (st *slotTunnel) run(ctx context.Context) {
+	// Dispatch outbox messages to slot channels round-robin
+	slotChans := make([]chan seqMsg, st.slots)
+	for i := range slotChans {
+		slotChans[i] = make(chan seqMsg, *flagBuf)
+	}
+
+	// Dispatcher: assigns seq numbers and round-robins to slots
+	go func() {
+		var seq uint64
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case data := <-st.Outbox:
+				encoded := base64.StdEncoding.EncodeToString(data)
+				chunks := split(encoded, st.chunk)
+				for ci, chunk := range chunks {
+					msg := seqMsg{
+						seq:  seq,
+						data: fmt.Sprintf("%d|%d/%d\n%s", seq, ci+1, len(chunks), chunk),
+					}
+					slot := int(seq) % st.slots
+					select {
+					case slotChans[slot] <- msg:
+					case <-ctx.Done():
+						return
+					}
+					seq++
+				}
+			}
+		}
+	}()
+
+	// N parallel senders
+	for i := 0; i < st.slots; i++ {
+		go st.slotSender(ctx, i, slotChans[i])
+	}
+
+	// N parallel receivers feed into a shared raw channel
+	rawCh := make(chan seqMsg, *flagBuf*st.slots)
+	for i := 0; i < st.slots; i++ {
+		go st.slotReceiver(ctx, i, rawCh)
+	}
+
+	// Reorder goroutine: delivers to Inbox in seq order
+	go st.reorder(ctx, rawCh)
+}
+
+type seqMsg struct {
+	seq  uint64
+	data string
+}
+
+func (st *slotTunnel) slotSender(ctx context.Context, slot int, ch chan seqMsg) {
+	c := st.sendSlots[slot]
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg := <-ch:
+			// Write and wait for ACK
+			for c.write(msg.data) != nil {
+				time.Sleep(st.poll)
+			}
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				content, err := c.read()
+				if err == nil && strings.TrimSpace(content) == "" {
+					break
+				}
+				time.Sleep(st.poll)
+			}
+		}
+	}
+}
+
+func (st *slotTunnel) slotReceiver(ctx context.Context, slot int, rawCh chan seqMsg) {
+	c := st.recvSlots[slot]
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		content, err := c.read()
+		if err != nil {
+			time.Sleep(st.poll)
+			continue
+		}
+		content = strings.TrimSpace(content)
+		if content == "" {
+			time.Sleep(st.poll)
+			continue
+		}
+		// ACK: clear the note
+		for c.write("") != nil {
+			time.Sleep(st.poll)
+		}
+		// Parse seq from "seq|chunk_header\ndata"
+		pipe := strings.IndexByte(content, '|')
+		if pipe < 0 {
+			continue
+		}
+		seq, err := strconv.ParseUint(content[:pipe], 10, 64)
+		if err != nil {
+			continue
+		}
+		select {
+		case rawCh <- seqMsg{seq: seq, data: content[pipe+1:]}:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (st *slotTunnel) reorder(ctx context.Context, rawCh chan seqMsg) {
+	var nextSeq uint64
+	pending := make(map[uint64]string)
+	// Reassembly state
+	var parts []string
+	var totalParts int
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg := <-rawCh:
+			pending[msg.seq] = msg.data
+
+			for {
+				data, ok := pending[nextSeq]
+				if !ok {
+					break
+				}
+				delete(pending, nextSeq)
+				nextSeq++
+
+				// Parse chunk header: "i/total\ndata"
+				i, n, body := parseChunk(data)
+				if i <= 0 {
+					// Single chunk, decode directly
+					decoded, err := base64.StdEncoding.DecodeString(data)
+					if err != nil {
+						continue
+					}
+					select {
+					case st.Inbox <- decoded:
+					case <-ctx.Done():
+						return
+					}
+					continue
+				}
+
+				if i == 1 {
+					parts = make([]string, 0, n)
+					totalParts = n
+				}
+				if n != totalParts || i != len(parts)+1 {
+					slog.Warn("reorder chunk mismatch, resetting", "i", i, "expected", len(parts)+1)
+					parts, totalParts = nil, 0
+					continue
+				}
+				parts = append(parts, body)
+				if len(parts) == totalParts {
+					decoded, err := base64.StdEncoding.DecodeString(strings.Join(parts, ""))
+					if err != nil {
+						parts, totalParts = nil, 0
+						continue
+					}
+					select {
+					case st.Inbox <- decoded:
+					case <-ctx.Done():
+						return
+					}
+					parts, totalParts = nil, 0
+				}
+			}
+		}
+	}
+}
+
+// --- tunnelConn: adapts slotTunnel to io.ReadWriteCloser for smux ---
+
+type tunnelConn struct {
+	st     *slotTunnel
+	rbuf   bytes.Buffer
+	ctx    context.Context
 	cancel context.CancelFunc
 }
 
-type mux struct {
-	ctrl    *tunnel
-	pool    *accountPool
-	streams map[string]*streamInfo
-	pending map[string]chan controlMsg
-	mu      sync.Mutex
-	ctx     context.Context
+func newTunnelConn(ctx context.Context, st *slotTunnel) *tunnelConn {
+	ctx, cancel := context.WithCancel(ctx)
+	return &tunnelConn{st: st, ctx: ctx, cancel: cancel}
 }
 
-func newMux(ctx context.Context, ctrl *tunnel, pool *accountPool) *mux {
-	return &mux{
-		ctrl:    ctrl,
-		pool:    pool,
-		streams: make(map[string]*streamInfo),
-		pending: make(map[string]chan controlMsg),
-		ctx:     ctx,
+func (tc *tunnelConn) Read(p []byte) (int, error) {
+	if tc.rbuf.Len() > 0 {
+		return tc.rbuf.Read(p)
 	}
-}
-
-func (m *mux) addStream(sid string, tun *tunnel, idx int, cancel context.CancelFunc) {
-	m.mu.Lock()
-	m.streams[sid] = &streamInfo{tun: tun, idx: idx, cancel: cancel}
-	m.mu.Unlock()
-}
-
-func (m *mux) closeStream(sid string) {
-	m.mu.Lock()
-	si, ok := m.streams[sid]
-	if ok {
-		delete(m.streams, sid)
-	}
-	m.mu.Unlock()
-	if ok {
-		si.cancel()
-		m.pool.release(si.idx)
-		slog.Debug("released account pair", "sid", sid, "idx", si.idx)
-	}
-}
-
-func (m *mux) sendControl(msg controlMsg) {
-	data, _ := json.Marshal(msg)
-	m.ctrl.Outbox <- string(data)
-}
-
-// --- server ---
-
-func (m *mux) serverLoop(upstreamAddr string) {
-	slog.Info("tunnel ready", "upstream", upstreamAddr)
-	for {
-		select {
-		case <-m.ctx.Done():
-			return
-		case raw := <-m.ctrl.Inbox:
-			var msg controlMsg
-			if json.Unmarshal([]byte(raw), &msg) != nil {
-				continue
-			}
-			switch msg.Type {
-			case "open":
-				go m.serverOpenStream(msg.SID, msg.Idx, upstreamAddr)
-			case "close":
-				slog.Info("stream closed", "sid", msg.SID, "by", "client")
-				m.closeStream(msg.SID)
-			}
-		}
-	}
-}
-
-func (m *mux) serverOpenStream(sid string, idx int, upstreamAddr string) {
-	slog.Debug("opening stream", "sid", sid, "idx", idx)
-
-	ae, ap, be, bp := m.pool.derive(idx)
-	a := &client{ae, ap}
-	b := &client{be, bp}
-
-	if !m.pool.isRegistered(idx) {
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() { defer wg.Done(); a.register(); a.write("") }()
-		go func() { defer wg.Done(); b.register(); b.write("") }()
-		wg.Wait()
-		m.pool.markRegistered(idx)
-		slog.Debug("registered account pair", "idx", idx)
-	} else {
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() { defer wg.Done(); a.write("") }()
-		go func() { defer wg.Done(); b.write("") }()
-		wg.Wait()
-		slog.Debug("reusing account pair", "idx", idx)
-	}
-
-	m.sendControl(controlMsg{Type: "ready", SID: sid, Idx: idx})
-
-	sctx, cancel := context.WithCancel(m.ctx)
-	// server sends on b, recvs on a
-	tun := newTunnel(b, a)
-	tun.run(sctx)
-	m.addStream(sid, tun, idx, cancel)
-
-	conn, err := net.Dial("tcp", upstreamAddr)
-	if err != nil {
-		slog.Error("dial upstream failed", "sid", sid, "err", err)
-		m.closeStream(sid)
-		m.sendControl(controlMsg{Type: "close", SID: sid})
-		return
-	}
-	slog.Info("stream opened", "sid", sid, "idx", idx, "upstream", upstreamAddr)
-	tunnelRelay(sctx, tun, conn)
-	conn.Close()
-	slog.Info("stream closed", "sid", sid, "idx", idx)
-	m.closeStream(sid)
-	m.sendControl(controlMsg{Type: "close", SID: sid})
-}
-
-// --- client ---
-
-func (m *mux) clientLoop() {
-	for {
-		select {
-		case <-m.ctx.Done():
-			return
-		case raw := <-m.ctrl.Inbox:
-			var msg controlMsg
-			if json.Unmarshal([]byte(raw), &msg) != nil {
-				continue
-			}
-			switch msg.Type {
-			case "ready":
-				m.mu.Lock()
-				ch, ok := m.pending[msg.SID]
-				if ok {
-					delete(m.pending, msg.SID)
-				}
-				m.mu.Unlock()
-				if ok {
-					ch <- msg
-				}
-			case "close":
-				slog.Info("stream closed", "sid", msg.SID, "by", "server")
-				m.closeStream(msg.SID)
-			}
-		}
-	}
-}
-
-func (m *mux) clientOpenStream(conn net.Conn) {
-	remote := conn.RemoteAddr().String()
-	sid := randHex(8)
-	idx := m.pool.acquire()
-	slog.Debug("opening stream", "sid", sid, "idx", idx, "remote", remote)
-
-	ch := make(chan controlMsg, 1)
-	m.mu.Lock()
-	m.pending[sid] = ch
-	m.mu.Unlock()
-
-	m.sendControl(controlMsg{Type: "open", SID: sid, Idx: idx})
-
 	select {
-	case <-ch:
-	case <-time.After(30 * time.Second):
-		slog.Error("stream open timeout", "sid", sid)
-		m.mu.Lock()
-		delete(m.pending, sid)
-		m.mu.Unlock()
-		m.pool.release(idx)
-		conn.Close()
-		return
+	case data, ok := <-tc.st.Inbox:
+		if !ok {
+			return 0, io.EOF
+		}
+		tc.rbuf.Write(data)
+		return tc.rbuf.Read(p)
+	case <-tc.ctx.Done():
+		return 0, io.EOF
 	}
-
-	sctx, cancel := context.WithCancel(m.ctx)
-	// client sends on a, recvs on b (derived deterministically)
-	ae, ap, be, bp := m.pool.derive(idx)
-	tun := newTunnel(&client{ae, ap}, &client{be, bp})
-	tun.run(sctx)
-	m.addStream(sid, tun, idx, cancel)
-
-	slog.Info("stream opened", "sid", sid, "idx", idx, "remote", remote)
-	tunnelRelay(sctx, tun, conn)
-	conn.Close()
-	slog.Info("stream closed", "sid", sid, "idx", idx, "remote", remote)
-	m.closeStream(sid)
-	m.sendControl(controlMsg{Type: "close", SID: sid})
 }
 
-// --- tunnel relay ---
+func (tc *tunnelConn) Write(p []byte) (int, error) {
+	buf := make([]byte, len(p))
+	copy(buf, p)
+	select {
+	case tc.st.Outbox <- buf:
+		return len(p), nil
+	case <-tc.ctx.Done():
+		return 0, io.ErrClosedPipe
+	}
+}
 
-func tunnelRelay(ctx context.Context, tun *tunnel, conn net.Conn) {
+func (tc *tunnelConn) Close() error {
+	tc.cancel()
+	return nil
+}
+
+// --- relay: smux stream ↔ TCP conn ---
+
+func relay(stream *smux.Stream, conn net.Conn) {
 	done := make(chan struct{}, 2)
-
-	// TCP → tunnel
 	go func() {
 		defer func() { done <- struct{}{} }()
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := conn.Read(buf)
-			if n > 0 {
-				select {
-				case tun.Outbox <- base64.StdEncoding.EncodeToString(buf[:n]):
-				case <-ctx.Done():
-					return
-				}
-			}
-			if err != nil {
-				return
-			}
-		}
+		io.Copy(conn, stream)
 	}()
-
-	// tunnel → TCP
 	go func() {
 		defer func() { done <- struct{}{} }()
-		for {
-			select {
-			case msg, ok := <-tun.Inbox:
-				if !ok {
-					return
-				}
-				data, err := base64.StdEncoding.DecodeString(msg)
-				if err != nil {
-					continue
-				}
-				conn.Write(data)
-			case <-ctx.Done():
-				return
-			}
-		}
+		io.Copy(stream, conn)
 	}()
-
 	<-done
+}
+
+// --- server/client setup ---
+
+func registerSlotAccounts(pool *accountPool, slots int) ([]*client, []*client) {
+	sendSlots := make([]*client, slots)
+	recvSlots := make([]*client, slots)
+
+	var wg sync.WaitGroup
+	for i := 0; i < slots; i++ {
+		wg.Add(1)
+		go func(slot int) {
+			defer wg.Done()
+			eA, pA, eB, pB := pool.derive(slot)
+			a := &client{eA, pA}
+			b := &client{eB, pB}
+			a.register()
+			b.register()
+			a.write("")
+			b.write("")
+			// Server sends on B, recvs on A
+			sendSlots[slot] = b
+			recvSlots[slot] = a
+		}(i)
+	}
+	wg.Wait()
+	return sendSlots, recvSlots
+}
+
+func deriveSlotClients(pool *accountPool, slots int) ([]*client, []*client) {
+	sendSlots := make([]*client, slots)
+	recvSlots := make([]*client, slots)
+	for i := 0; i < slots; i++ {
+		eA, pA, eB, pB := pool.derive(i)
+		// Client sends on A, recvs on B
+		sendSlots[i] = &client{eA, pA}
+		recvSlots[i] = &client{eB, pB}
+	}
+	return sendSlots, recvSlots
+}
+
+func publishRendezvous(rv *client) error {
+	slog.Info("registering rendezvous account")
+	rv.register()
+	if err := rv.write("ready"); err != nil {
+		return err
+	}
+	slog.Info("rendezvous published, waiting for client")
+	return nil
+}
+
+func waitRendezvous(rv *client) error {
+	slog.Info("waiting for rendezvous")
+	for {
+		content, err := rv.read()
+		if err != nil {
+			time.Sleep(time.Second)
+			continue
+		}
+		if strings.TrimSpace(content) != "" {
+			break
+		}
+		time.Sleep(*flagPoll)
+	}
+	slog.Info("rendezvous received")
+	return nil
 }
 
 // --- main ---
@@ -652,28 +515,74 @@ func main() {
 	role, addr := *flagRole, *flagAddr
 	ctx := context.Background()
 	rv := &client{*flagEmail, *flagPass}
-
-	slog.Info("starting", "role", role, "addr", addr)
-
-	var ctrl *tunnel
-	var err error
-	if role == "server" {
-		ctrl, err = startServer(ctx, rv)
-	} else {
-		ctrl, err = startClient(ctx, rv)
-	}
-	if err != nil {
-		slog.Error("tunnel setup failed", "err", err)
-		os.Exit(1)
-	}
-
 	pool := newAccountPool(*flagEmail, *flagPass)
-	m := newMux(ctx, ctrl, pool)
+	slots := *flagSlots
+
+	slog.Info("starting", "role", role, "addr", addr, "slots", slots)
+
+	// Rendezvous: server publishes, client reads — just a handshake
+	if role == "server" {
+		if err := publishRendezvous(rv); err != nil {
+			slog.Error("rendezvous failed", "err", err)
+			os.Exit(1)
+		}
+	} else {
+		if err := waitRendezvous(rv); err != nil {
+			slog.Error("rendezvous failed", "err", err)
+			os.Exit(1)
+		}
+	}
+
+	// Register/derive slot accounts
+	slog.Info("setting up slot accounts", "slots", slots)
+	var sendSlots, recvSlots []*client
+	if role == "server" {
+		sendSlots, recvSlots = registerSlotAccounts(pool, slots)
+	} else {
+		sendSlots, recvSlots = deriveSlotClients(pool, slots)
+	}
+	slog.Info("slot accounts ready")
+
+	// Create slot tunnel
+	st := newSlotTunnel(slots, sendSlots, recvSlots)
+	st.run(ctx)
+
+	// Wrap in tunnelConn for smux
+	tc := newTunnelConn(ctx, st)
 
 	if role == "server" {
-		m.serverLoop(addr)
+		sess, err := smux.Server(tc, nil)
+		if err != nil {
+			slog.Error("smux server failed", "err", err)
+			os.Exit(1)
+		}
+		slog.Info("tunnel ready, waiting for streams", "upstream", addr)
+		for {
+			stream, err := sess.AcceptStream()
+			if err != nil {
+				slog.Error("accept stream failed", "err", err)
+				return
+			}
+			slog.Debug("stream accepted", "id", stream.ID())
+			go func() {
+				defer stream.Close()
+				conn, err := net.Dial("tcp", addr)
+				if err != nil {
+					slog.Error("dial upstream failed", "err", err)
+					return
+				}
+				defer conn.Close()
+				slog.Info("stream opened", "id", stream.ID(), "upstream", addr)
+				relay(stream, conn)
+				slog.Info("stream closed", "id", stream.ID())
+			}()
+		}
 	} else {
-		go m.clientLoop()
+		sess, err := smux.Client(tc, nil)
+		if err != nil {
+			slog.Error("smux client failed", "err", err)
+			os.Exit(1)
+		}
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
 			slog.Error("listen failed", "addr", addr, "err", err)
@@ -686,7 +595,18 @@ func main() {
 				slog.Error("accept failed", "err", err)
 				continue
 			}
-			go m.clientOpenStream(conn)
+			go func() {
+				defer conn.Close()
+				stream, err := sess.OpenStream()
+				if err != nil {
+					slog.Error("open stream failed", "err", err)
+					return
+				}
+				defer stream.Close()
+				slog.Debug("stream opened", "id", stream.ID(), "remote", conn.RemoteAddr())
+				relay(stream, conn)
+				slog.Debug("stream closed", "id", stream.ID())
+			}()
 		}
 	}
 }
