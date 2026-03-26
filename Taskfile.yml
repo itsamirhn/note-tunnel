@@ -1,0 +1,43 @@
+version: '3'
+
+dotenv: ['.env']
+
+vars:
+  NAME: note-tunnel
+  OUT: dist
+  FLAGS: -trimpath -ldflags="-s -w -X main.baseURL={{.BASE_URL}}"
+
+tasks:
+  default:
+    cmds:
+      - task: build-all
+
+  clean:
+    cmds:
+      - rm -rf {{.OUT}}
+
+  build:
+    desc: Build for current platform
+    cmds:
+      - go build {{.FLAGS}} -o {{.OUT}}/{{.NAME}} .
+
+  build-all:
+    desc: Build for all platforms
+    deps: [clean]
+    cmds:
+      - for:
+          - {GOOS: linux, GOARCH: amd64}
+          - {GOOS: linux, GOARCH: arm64}
+          - {GOOS: linux, GOARCH: arm}
+          - {GOOS: linux, GOARCH: 386}
+          - {GOOS: darwin, GOARCH: amd64}
+          - {GOOS: darwin, GOARCH: arm64}
+          - {GOOS: windows, GOARCH: amd64}
+          - {GOOS: windows, GOARCH: arm64}
+          - {GOOS: windows, GOARCH: 386}
+          - {GOOS: freebsd, GOARCH: amd64}
+          - {GOOS: freebsd, GOARCH: arm64}
+          - {GOOS: openbsd, GOARCH: amd64}
+        cmd: >-
+          GOOS={{.ITEM.GOOS}} GOARCH={{.ITEM.GOARCH}} go build {{.FLAGS}}
+          -o {{.OUT}}/{{.NAME}}-{{.ITEM.GOOS}}-{{.ITEM.GOARCH}}{{if eq .ITEM.GOOS "windows"}}.exe{{end}} .
