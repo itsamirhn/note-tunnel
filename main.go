@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
@@ -120,6 +122,65 @@ func randHex(n int) string {
 
 func randAccount() (string, string) {
 	return fmt.Sprintf("tun-%s@t.io", randHex(8)), randHex(16)
+}
+
+// --- account pool ---
+
+type accountPool struct {
+	seed       []byte
+	free       []int
+	next       int
+	registered map[int]bool
+	mu         sync.Mutex
+}
+
+func newAccountPool(email, pass string) *accountPool {
+	h := sha256.Sum256([]byte(email + ":" + pass))
+	return &accountPool{seed: h[:], registered: make(map[int]bool)}
+}
+
+func (p *accountPool) derive(idx int) (emailA, passA, emailB, passB string) {
+	d := func(label string) string {
+		mac := hmac.New(sha256.New, p.seed)
+		mac.Write([]byte(fmt.Sprintf("%s-%d", label, idx)))
+		return hex.EncodeToString(mac.Sum(nil))
+	}
+	emailA = fmt.Sprintf("tun-%s@t.io", d("ae")[:16])
+	passA = d("ap")[:32]
+	emailB = fmt.Sprintf("tun-%s@t.io", d("be")[:16])
+	passB = d("bp")[:32]
+	return
+}
+
+func (p *accountPool) acquire() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.free) > 0 {
+		idx := p.free[len(p.free)-1]
+		p.free = p.free[:len(p.free)-1]
+		return idx
+	}
+	idx := p.next
+	p.next++
+	return idx
+}
+
+func (p *accountPool) release(idx int) {
+	p.mu.Lock()
+	p.free = append(p.free, idx)
+	p.mu.Unlock()
+}
+
+func (p *accountPool) isRegistered(idx int) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.registered[idx]
+}
+
+func (p *accountPool) markRegistered(idx int) {
+	p.mu.Lock()
+	p.registered[idx] = true
+	p.mu.Unlock()
 }
 
 func startServer(ctx context.Context, rv *client) (*tunnel, error) {
@@ -325,39 +386,39 @@ func parseChunk(raw string) (int, int, string) {
 type controlMsg struct {
 	Type string `json:"type"`
 	SID  string `json:"sid"`
-	SE   string `json:"se,omitempty"`
-	SP   string `json:"sp,omitempty"`
-	RE   string `json:"re,omitempty"`
-	RP   string `json:"rp,omitempty"`
+	Idx  int    `json:"idx"`
 }
 
 // --- mux ---
 
 type streamInfo struct {
 	tun    *tunnel
+	idx    int
 	cancel context.CancelFunc
 }
 
 type mux struct {
 	ctrl    *tunnel
+	pool    *accountPool
 	streams map[string]*streamInfo
 	pending map[string]chan controlMsg
 	mu      sync.Mutex
 	ctx     context.Context
 }
 
-func newMux(ctx context.Context, ctrl *tunnel) *mux {
+func newMux(ctx context.Context, ctrl *tunnel, pool *accountPool) *mux {
 	return &mux{
 		ctrl:    ctrl,
+		pool:    pool,
 		streams: make(map[string]*streamInfo),
 		pending: make(map[string]chan controlMsg),
 		ctx:     ctx,
 	}
 }
 
-func (m *mux) addStream(sid string, tun *tunnel, cancel context.CancelFunc) {
+func (m *mux) addStream(sid string, tun *tunnel, idx int, cancel context.CancelFunc) {
 	m.mu.Lock()
-	m.streams[sid] = &streamInfo{tun: tun, cancel: cancel}
+	m.streams[sid] = &streamInfo{tun: tun, idx: idx, cancel: cancel}
 	m.mu.Unlock()
 }
 
@@ -370,6 +431,8 @@ func (m *mux) closeStream(sid string) {
 	m.mu.Unlock()
 	if ok {
 		si.cancel()
+		m.pool.release(si.idx)
+		slog.Debug("released account pair", "sid", sid, "idx", si.idx)
 	}
 }
 
@@ -393,7 +456,7 @@ func (m *mux) serverLoop(upstreamAddr string) {
 			}
 			switch msg.Type {
 			case "open":
-				go m.serverOpenStream(msg.SID, upstreamAddr)
+				go m.serverOpenStream(msg.SID, msg.Idx, upstreamAddr)
 			case "close":
 				slog.Info("stream closed", "sid", msg.SID, "by", "client")
 				m.closeStream(msg.SID)
@@ -402,27 +465,37 @@ func (m *mux) serverLoop(upstreamAddr string) {
 	}
 }
 
-func (m *mux) serverOpenStream(sid, upstreamAddr string) {
-	slog.Debug("opening stream", "sid", sid)
+func (m *mux) serverOpenStream(sid string, idx int, upstreamAddr string) {
+	slog.Debug("opening stream", "sid", sid, "idx", idx)
 
-	ae, ap := randAccount()
-	be, bp := randAccount()
+	ae, ap, be, bp := m.pool.derive(idx)
 	a := &client{ae, ap}
 	b := &client{be, bp}
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); a.register(); a.write("") }()
-	go func() { defer wg.Done(); b.register(); b.write("") }()
-	wg.Wait()
+	if !m.pool.isRegistered(idx) {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); a.register(); a.write("") }()
+		go func() { defer wg.Done(); b.register(); b.write("") }()
+		wg.Wait()
+		m.pool.markRegistered(idx)
+		slog.Debug("registered account pair", "idx", idx)
+	} else {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); a.write("") }()
+		go func() { defer wg.Done(); b.write("") }()
+		wg.Wait()
+		slog.Debug("reusing account pair", "idx", idx)
+	}
 
-	m.sendControl(controlMsg{Type: "opened", SID: sid, SE: ae, SP: ap, RE: be, RP: bp})
+	m.sendControl(controlMsg{Type: "ready", SID: sid, Idx: idx})
 
 	sctx, cancel := context.WithCancel(m.ctx)
 	// server sends on b, recvs on a
 	tun := newTunnel(b, a)
 	tun.run(sctx)
-	m.addStream(sid, tun, cancel)
+	m.addStream(sid, tun, idx, cancel)
 
 	conn, err := net.Dial("tcp", upstreamAddr)
 	if err != nil {
@@ -431,10 +504,10 @@ func (m *mux) serverOpenStream(sid, upstreamAddr string) {
 		m.sendControl(controlMsg{Type: "close", SID: sid})
 		return
 	}
-	slog.Info("stream opened", "sid", sid, "upstream", upstreamAddr)
+	slog.Info("stream opened", "sid", sid, "idx", idx, "upstream", upstreamAddr)
 	tunnelRelay(sctx, tun, conn)
 	conn.Close()
-	slog.Info("stream closed", "sid", sid)
+	slog.Info("stream closed", "sid", sid, "idx", idx)
 	m.closeStream(sid)
 	m.sendControl(controlMsg{Type: "close", SID: sid})
 }
@@ -452,7 +525,7 @@ func (m *mux) clientLoop() {
 				continue
 			}
 			switch msg.Type {
-			case "opened":
+			case "ready":
 				m.mu.Lock()
 				ch, ok := m.pending[msg.SID]
 				if ok {
@@ -473,37 +546,39 @@ func (m *mux) clientLoop() {
 func (m *mux) clientOpenStream(conn net.Conn) {
 	remote := conn.RemoteAddr().String()
 	sid := randHex(8)
-	slog.Debug("opening stream", "sid", sid, "remote", remote)
+	idx := m.pool.acquire()
+	slog.Debug("opening stream", "sid", sid, "idx", idx, "remote", remote)
 
 	ch := make(chan controlMsg, 1)
 	m.mu.Lock()
 	m.pending[sid] = ch
 	m.mu.Unlock()
 
-	m.sendControl(controlMsg{Type: "open", SID: sid})
+	m.sendControl(controlMsg{Type: "open", SID: sid, Idx: idx})
 
-	var reply controlMsg
 	select {
-	case reply = <-ch:
+	case <-ch:
 	case <-time.After(30 * time.Second):
 		slog.Error("stream open timeout", "sid", sid)
 		m.mu.Lock()
 		delete(m.pending, sid)
 		m.mu.Unlock()
+		m.pool.release(idx)
 		conn.Close()
 		return
 	}
 
 	sctx, cancel := context.WithCancel(m.ctx)
-	// client sends on a (SE/SP), recvs on b (RE/RP)
-	tun := newTunnel(&client{reply.SE, reply.SP}, &client{reply.RE, reply.RP})
+	// client sends on a, recvs on b (derived deterministically)
+	ae, ap, be, bp := m.pool.derive(idx)
+	tun := newTunnel(&client{ae, ap}, &client{be, bp})
 	tun.run(sctx)
-	m.addStream(sid, tun, cancel)
+	m.addStream(sid, tun, idx, cancel)
 
-	slog.Info("stream opened", "sid", sid, "remote", remote)
+	slog.Info("stream opened", "sid", sid, "idx", idx, "remote", remote)
 	tunnelRelay(sctx, tun, conn)
 	conn.Close()
-	slog.Info("stream closed", "sid", sid, "remote", remote)
+	slog.Info("stream closed", "sid", sid, "idx", idx, "remote", remote)
 	m.closeStream(sid)
 	m.sendControl(controlMsg{Type: "close", SID: sid})
 }
@@ -592,7 +667,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	m := newMux(ctx, ctrl)
+	pool := newAccountPool(*flagEmail, *flagPass)
+	m := newMux(ctx, ctrl, pool)
 
 	if role == "server" {
 		m.serverLoop(addr)
