@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -31,6 +32,7 @@ var (
 	flagPoll  = flag.Duration("poll", 100*time.Millisecond, "polling interval")
 	flagChunk = flag.Int("chunk", 70000, "max chunk size in bytes")
 	flagBuf   = flag.Int("buf", 16, "tunnel channel buffer size")
+	flagDebug = flag.Bool("debug", false, "enable debug logging")
 )
 
 var baseURL string // set via -ldflags "-X main.baseURL=..."
@@ -46,6 +48,7 @@ var (
 type client struct{ email, password string }
 
 func (c *client) register() error {
+	slog.Debug("registering account", "email", c.email)
 	cap, err := getCaptcha("sign.php")
 	if err != nil {
 		return err
@@ -55,12 +58,14 @@ func (c *client) register() error {
 		return err
 	}
 	if strings.Contains(resp, "موفقیت") || strings.Contains(resp, "قبلا") {
+		slog.Debug("register ok", "email", c.email)
 		return nil
 	}
 	return fmt.Errorf("register failed")
 }
 
 func (c *client) read() (string, error) {
+	slog.Debug("reading note", "email", c.email)
 	cap, err := getCaptcha("web.php")
 	if err != nil {
 		return "", err
@@ -76,21 +81,25 @@ func (c *client) read() (string, error) {
 	if m == nil {
 		return "", fmt.Errorf("no content")
 	}
+	slog.Debug("read note", "email", c.email, "len", len(m[1]))
 	return m[1], nil
 }
 
 func (c *client) write(content string) error {
+	slog.Debug("writing note", "email", c.email, "len", len(content))
 	resp, err := post("save.php", url.Values{"txt": {content}, "huser": {b64(c.email)}, "hpass": {b64(c.password)}, "save": {"save"}})
 	if err != nil {
 		return err
 	}
 	if strings.Contains(resp, "ذخيره شد") {
+		slog.Debug("write ok", "email", c.email)
 		return nil
 	}
 	return fmt.Errorf("save failed")
 }
 
 func getCaptcha(page string) (string, error) {
+	slog.Debug("fetching captcha", "page", page)
 	resp, err := httpClient.Get(baseURL + "/" + page)
 	if err != nil {
 		return "", err
@@ -104,10 +113,12 @@ func getCaptcha(page string) (string, error) {
 	if m == nil {
 		return "", fmt.Errorf("no captcha")
 	}
+	slog.Debug("captcha solved", "page", page, "value", string(m[1]))
 	return string(m[1]), nil
 }
 
 func post(path string, data url.Values) (string, error) {
+	slog.Debug("POST", "path", path)
 	resp, err := httpClient.PostForm(baseURL+"/"+path, data)
 	if err != nil {
 		return "", err
@@ -117,6 +128,7 @@ func post(path string, data url.Values) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	slog.Debug("POST response", "path", path, "status", resp.StatusCode, "len", len(body))
 	return string(body), nil
 }
 
@@ -149,9 +161,11 @@ func randAccount() (string, string) {
 }
 
 func startServer(ctx context.Context, rv *client) (*tunnel, error) {
+	slog.Info("registering rendezvous account")
 	rv.register()
 	ae, ap := randAccount()
 	be, bp := randAccount()
+	slog.Debug("created tunnel accounts", "send", be, "recv", ae)
 	a := &client{ae, ap}
 	b := &client{be, bp}
 	if err := a.register(); err != nil {
@@ -163,15 +177,18 @@ func startServer(ctx context.Context, rv *client) (*tunnel, error) {
 	a.write("")
 	b.write("")
 	data, _ := json.Marshal(rendezvousInfo{ae, ap, be, bp})
+	slog.Debug("publishing rendezvous info")
 	if err := rv.write(string(data)); err != nil {
 		return nil, err
 	}
+	slog.Info("rendezvous published, waiting for client")
 	t := newTunnel(b, a)
 	t.run(ctx)
 	return t, nil
 }
 
 func startClient(ctx context.Context, rv *client) (*tunnel, error) {
+	slog.Info("waiting for rendezvous info")
 	var info rendezvousInfo
 	for {
 		select {
@@ -181,21 +198,26 @@ func startClient(ctx context.Context, rv *client) (*tunnel, error) {
 		}
 		content, err := rv.read()
 		if err != nil {
+			slog.Debug("rendezvous read error", "err", err)
 			time.Sleep(time.Second)
 			continue
 		}
 		content = strings.TrimSpace(content)
 		if content == "" {
+			slog.Debug("rendezvous empty, retrying")
 			time.Sleep(*flagPoll)
 			continue
 		}
 		info = rendezvousInfo{}
 		if err := json.Unmarshal([]byte(content), &info); err != nil || info.AE == "" {
+			slog.Debug("rendezvous bad data, retrying", "err", err)
 			time.Sleep(time.Second)
 			continue
 		}
 		break
 	}
+	slog.Info("rendezvous received")
+	slog.Debug("tunnel accounts", "send", info.AE, "recv", info.BE)
 	t := newTunnel(&client{info.AE, info.AP}, &client{info.BE, info.BP})
 	t.run(ctx)
 	return t, nil
@@ -217,7 +239,9 @@ func (t *tunnel) run(ctx context.Context) {
 }
 
 func (t *tunnel) sendRaw(ctx context.Context, data string) bool {
+	slog.Debug("sendRaw", "len", len(data))
 	for t.send.write(data) != nil {
+		slog.Debug("sendRaw write retry")
 		time.Sleep(t.poll)
 	}
 	for {
@@ -228,8 +252,10 @@ func (t *tunnel) sendRaw(ctx context.Context, data string) bool {
 		}
 		c, err := t.send.read()
 		if err == nil && strings.TrimSpace(c) == "" {
+			slog.Debug("sendRaw acked")
 			return true
 		}
+		slog.Debug("sendRaw waiting for ack")
 		time.Sleep(t.poll)
 	}
 }
@@ -243,6 +269,7 @@ func (t *tunnel) recvRaw(ctx context.Context) (string, bool) {
 		}
 		content, err := t.recv.read()
 		if err != nil {
+			slog.Debug("recvRaw read error", "err", err)
 			time.Sleep(t.poll)
 			continue
 		}
@@ -251,9 +278,12 @@ func (t *tunnel) recvRaw(ctx context.Context) (string, bool) {
 			time.Sleep(t.poll)
 			continue
 		}
+		slog.Debug("recvRaw got data", "len", len(content))
 		for t.recv.write("") != nil {
+			slog.Debug("recvRaw ack retry")
 			time.Sleep(t.poll)
 		}
+		slog.Debug("recvRaw acked")
 		return content, true
 	}
 }
@@ -265,6 +295,7 @@ func (t *tunnel) sendLoop(ctx context.Context) {
 			return
 		case msg := <-t.Outbox:
 			chunks := split(msg, t.chunk)
+			slog.Debug("sendLoop", "chunks", len(chunks), "len", len(msg))
 			for i, chunk := range chunks {
 				if !t.sendRaw(ctx, fmt.Sprintf("%d/%d\n%s", i+1, len(chunks), chunk)) {
 					return
@@ -284,6 +315,7 @@ func (t *tunnel) recvLoop(ctx context.Context) {
 		}
 		i, n, body := parseChunk(raw)
 		if i <= 0 {
+			slog.Debug("recvLoop unchunked message", "len", len(raw))
 			select {
 			case t.Inbox <- raw:
 			case <-ctx.Done():
@@ -291,18 +323,22 @@ func (t *tunnel) recvLoop(ctx context.Context) {
 			}
 			continue
 		}
+		slog.Debug("recvLoop chunk", "i", i, "n", n, "len", len(body))
 		if i == 1 {
 			parts = make([]string, 0, n)
 			total = n
 		}
 		if n != total || i != len(parts)+1 {
+			slog.Warn("recvLoop chunk out of order, resetting", "i", i, "expected", len(parts)+1)
 			parts, total = nil, 0
 			continue
 		}
 		parts = append(parts, body)
 		if len(parts) == total {
+			msg := strings.Join(parts, "")
+			slog.Debug("recvLoop assembled message", "chunks", total, "len", len(msg))
 			select {
-			case t.Inbox <- strings.Join(parts, ""):
+			case t.Inbox <- msg:
 			case <-ctx.Done():
 				return
 			}
@@ -360,12 +396,15 @@ func (tc *tunnelConn) Read(p []byte) (int, error) {
 	select {
 	case msg, ok := <-tc.tun.Inbox:
 		if !ok {
+			slog.Debug("tunnelConn read: inbox closed")
 			return 0, io.EOF
 		}
 		data, err := base64.StdEncoding.DecodeString(msg)
 		if err != nil {
+			slog.Error("tunnelConn read: base64 decode failed", "err", err)
 			return 0, err
 		}
+		slog.Debug("tunnelConn read", "bytes", len(data))
 		tc.rbuf.Write(data)
 		return tc.rbuf.Read(p)
 	case <-tc.closed:
@@ -379,6 +418,7 @@ func (tc *tunnelConn) Write(p []byte) (int, error) {
 		return 0, io.ErrClosedPipe
 	default:
 	}
+	slog.Debug("tunnelConn write", "bytes", len(p))
 	tc.tun.Outbox <- base64.StdEncoding.EncodeToString(p)
 	return len(p), nil
 }
@@ -387,6 +427,7 @@ func (tc *tunnelConn) Close() error {
 	select {
 	case <-tc.closed:
 	default:
+		slog.Debug("tunnelConn closed")
 		close(tc.closed)
 	}
 	return nil
@@ -422,6 +463,12 @@ func main() {
 	}
 	flag.Parse()
 
+	level := slog.LevelInfo
+	if *flagDebug {
+		level = slog.LevelDebug
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+
 	if *flagRole == "" || *flagEmail == "" || *flagPass == "" || *flagAddr == "" {
 		flag.Usage()
 		os.Exit(1)
@@ -429,6 +476,8 @@ func main() {
 	role, addr := *flagRole, *flagAddr
 	ctx := context.Background()
 	rv := &client{*flagEmail, *flagPass}
+
+	slog.Info("starting", "role", role, "addr", addr)
 
 	var t *tunnel
 	var err error
@@ -438,7 +487,7 @@ func main() {
 		t, err = startClient(ctx, rv)
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		slog.Error("tunnel setup failed", "err", err)
 		os.Exit(1)
 	}
 
@@ -448,54 +497,60 @@ func main() {
 	if role == "server" {
 		session, err := smux.Server(tc, cfg)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
+			slog.Error("smux server failed", "err", err)
 			os.Exit(1)
 		}
-		fmt.Fprintf(os.Stderr, "tunnel ready, forwarding to %s\n", addr)
+		slog.Info("tunnel ready", "upstream", addr)
 		for {
 			stream, err := session.AcceptStream()
 			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
+				slog.Error("accept stream failed", "err", err)
 				return
 			}
 			go func() {
+				sid := stream.ID()
+				slog.Debug("accepted stream", "stream", sid)
 				conn, err := net.Dial("tcp", addr)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "dial %s: %v\n", addr, err)
+					slog.Error("dial upstream failed", "stream", sid, "addr", addr, "err", err)
 					stream.Close()
 					return
 				}
-				fmt.Fprintf(os.Stderr, "stream %d → %s\n", stream.ID(), addr)
+				slog.Info("stream opened", "stream", sid, "upstream", addr)
 				relay(stream, conn)
+				slog.Info("stream closed", "stream", sid)
 			}()
 		}
 	} else {
 		session, err := smux.Client(tc, cfg)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
+			slog.Error("smux client failed", "err", err)
 			os.Exit(1)
 		}
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
+			slog.Error("listen failed", "addr", addr, "err", err)
 			os.Exit(1)
 		}
-		fmt.Fprintf(os.Stderr, "listening on %s\n", addr)
+		slog.Info("listening", "addr", addr)
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
+				slog.Error("accept failed", "err", err)
 				continue
 			}
 			go func() {
+				remote := conn.RemoteAddr().String()
+				slog.Debug("accepted connection", "remote", remote)
 				stream, err := session.OpenStream()
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "open stream: %v\n", err)
+					slog.Error("open stream failed", "err", err)
 					conn.Close()
 					return
 				}
-				fmt.Fprintf(os.Stderr, "%s → stream %d\n", conn.RemoteAddr(), stream.ID())
+				slog.Info("stream opened", "stream", stream.ID(), "remote", remote)
 				relay(stream, conn)
+				slog.Info("stream closed", "stream", stream.ID(), "remote", remote)
 			}()
 		}
 	}
