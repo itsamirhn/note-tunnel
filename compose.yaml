@@ -1,0 +1,17 @@
+services:
+  minisocks:
+    image: serjs/go-socks5-proxy
+    environment:
+      - REQUIRE_AUTH=false
+
+  server:
+    build: .
+    command: ["-role", "server", "-seed", "test", "-addr", "minisocks:1080", "-debug"]
+    depends_on:
+      - minisocks
+
+  client:
+    build: .
+    command: ["-role", "client", "-seed", "test", "-addr", "0.0.0.0:1080", "-debug"]
+    ports:
+      - "11080:1080"

@@ -26,11 +26,10 @@ import (
 )
 
 var (
-	flagRole  = flag.String("role", "", "server or client")
-	flagEmail = flag.String("email", "", "rendezvous account email")
-	flagPass  = flag.String("pass", "", "rendezvous account password")
-	flagAddr  = flag.String("addr", "", "server: upstream host:port, client: listen host:port")
-	flagPoll  = flag.Duration("poll", 100*time.Millisecond, "polling interval")
+	flagRole = flag.String("role", "", "server or client")
+	flagSeed = flag.String("seed", "", "shared secret seed for deriving all accounts")
+	flagAddr = flag.String("addr", "", "server: upstream host:port, client: listen host:port")
+	flagPoll  = flag.Duration("poll", 250*time.Millisecond, "polling interval")
 	flagChunk = flag.Int("chunk", 70000, "max chunk size in bytes")
 	flagBuf   = flag.Int("buf", 16, "tunnel channel buffer size")
 	flagSlots = flag.Int("slots", 4, "number of parallel note slots")
@@ -106,8 +105,8 @@ type accountPool struct {
 	seed []byte
 }
 
-func newAccountPool(email, pass string) *accountPool {
-	h := sha256.Sum256([]byte(email + ":" + pass))
+func newAccountPool(seed string) *accountPool {
+	h := sha256.Sum256([]byte(seed))
 	return &accountPool{seed: h[:]}
 }
 
@@ -123,8 +122,6 @@ func (p *accountPool) derive(slot int) (emailA, passA, emailB, passB string) {
 	passB = d("bp")[:32]
 	return
 }
-
-// --- rendezvous ---
 
 func split(s string, size int) []string {
 	if len(s) == 0 {
@@ -429,7 +426,7 @@ func relay(stream *smux.Stream, conn net.Conn) {
 
 // --- server/client setup ---
 
-func registerSlotAccounts(pool *accountPool, slots int) ([]*client, []*client) {
+func setupSlotAccounts(pool *accountPool, slots int, role string) ([]*client, []*client) {
 	sendSlots := make([]*client, slots)
 	recvSlots := make([]*client, slots)
 
@@ -445,59 +442,24 @@ func registerSlotAccounts(pool *accountPool, slots int) ([]*client, []*client) {
 			b.register()
 			a.write("")
 			b.write("")
-			// Server sends on B, recvs on A
-			sendSlots[slot] = b
-			recvSlots[slot] = a
+			if role == "server" {
+				sendSlots[slot] = b
+				recvSlots[slot] = a
+			} else {
+				sendSlots[slot] = a
+				recvSlots[slot] = b
+			}
 		}(i)
 	}
 	wg.Wait()
 	return sendSlots, recvSlots
 }
 
-func deriveSlotClients(pool *accountPool, slots int) ([]*client, []*client) {
-	sendSlots := make([]*client, slots)
-	recvSlots := make([]*client, slots)
-	for i := 0; i < slots; i++ {
-		eA, pA, eB, pB := pool.derive(i)
-		// Client sends on A, recvs on B
-		sendSlots[i] = &client{eA, pA}
-		recvSlots[i] = &client{eB, pB}
-	}
-	return sendSlots, recvSlots
-}
-
-func publishRendezvous(rv *client) error {
-	slog.Info("registering rendezvous account")
-	rv.register()
-	if err := rv.write("ready"); err != nil {
-		return err
-	}
-	slog.Info("rendezvous published, waiting for client")
-	return nil
-}
-
-func waitRendezvous(rv *client) error {
-	slog.Info("waiting for rendezvous")
-	for {
-		content, err := rv.read()
-		if err != nil {
-			time.Sleep(time.Second)
-			continue
-		}
-		if strings.TrimSpace(content) != "" {
-			break
-		}
-		time.Sleep(*flagPoll)
-	}
-	slog.Info("rendezvous received")
-	return nil
-}
-
 // --- main ---
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: note-tunnel -role <server|client> -email <email> -pass <pass> -addr <host:port>\n\n")
+		fmt.Fprintf(os.Stderr, "usage: note-tunnel -role <server|client> -seed <seed> -addr <host:port>\n\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -508,39 +470,19 @@ func main() {
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 
-	if *flagRole == "" || *flagEmail == "" || *flagPass == "" || *flagAddr == "" {
+	if *flagRole == "" || *flagSeed == "" || *flagAddr == "" {
 		flag.Usage()
 		os.Exit(1)
 	}
 	role, addr := *flagRole, *flagAddr
 	ctx := context.Background()
-	rv := &client{*flagEmail, *flagPass}
-	pool := newAccountPool(*flagEmail, *flagPass)
+	pool := newAccountPool(*flagSeed)
 	slots := *flagSlots
 
 	slog.Info("starting", "role", role, "addr", addr, "slots", slots)
 
-	// Rendezvous: server publishes, client reads — just a handshake
-	if role == "server" {
-		if err := publishRendezvous(rv); err != nil {
-			slog.Error("rendezvous failed", "err", err)
-			os.Exit(1)
-		}
-	} else {
-		if err := waitRendezvous(rv); err != nil {
-			slog.Error("rendezvous failed", "err", err)
-			os.Exit(1)
-		}
-	}
-
-	// Register/derive slot accounts
 	slog.Info("setting up slot accounts", "slots", slots)
-	var sendSlots, recvSlots []*client
-	if role == "server" {
-		sendSlots, recvSlots = registerSlotAccounts(pool, slots)
-	} else {
-		sendSlots, recvSlots = deriveSlotClients(pool, slots)
-	}
+	sendSlots, recvSlots := setupSlotAccounts(pool, slots, role)
 	slog.Info("slot accounts ready")
 
 	// Create slot tunnel
